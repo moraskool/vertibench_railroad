@@ -12,7 +12,7 @@ class Asset():
     """"Class that initializes an asset"""
 
     def __init__(self, visual_shape_path, scale=None, collision_shape_path=None, bounding_box=None):
-        if (scale == None):
+        if (scale is None):
             self.scale = 1
             self.scaled = False
         else:
@@ -41,9 +41,9 @@ class Asset():
 
         # Get the collision mesh
         collision_shape_obj = None
-        if (collision_shape_path == None):
+        if (collision_shape_path is None):
             # Just use the bounding box
-            if (bounding_box == None):
+            if (bounding_box is None):
                 self.body.EnableCollision(False)
                 self.collide_flag = False
             else:
