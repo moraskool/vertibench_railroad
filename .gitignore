@@ -64,3 +64,16 @@ logs/
 /envs/data/BenchMaps/sampled_maps/Configs/tmp/*
 assets/pychrono-9.0.1-py39_1.tar.bz2
 /envs/data/BenchMaps/sampled_maps/Trajs/*
+
+# --- RAIL data-collection outputs: keep large/generated artifacts LOCAL, never commit or LFS-push ---
+# commit only the tidy CSV under /results/, ignore everything else we produce there
+/results/*
+!/results/
+!/results/terrain_crossing.csv
+# generated media/models stay local (these extensions are LFS-tracked upstream; ignoring stops accidental LFS pushes to the fork)
+*.mp4
+*.gif
+*.hdf5
+*.pt
+*.torch
+*.jit
