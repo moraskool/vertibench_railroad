@@ -157,7 +157,7 @@ class ManualSim:
         if self.vehicle_type_lower in ['m113']:
             self.vis =veh.ChTrackedVehicleVisualSystemIrrlicht()
         self.vis.SetWindowTitle('vws in the wild')
-        self.vis.SetWindowSize(3840, 2160)
+        self.vis.SetWindowSize(1280, 720)
         
         if self.vehicle_type_lower in ['man5t', 'man7t', 'man10t']:
             trackPoint = chrono.ChVector3d(-5.5, 0.0, 2.6)
