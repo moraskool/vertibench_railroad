@@ -43,6 +43,13 @@ class PIDSim:
         self.max_time = config['max_time']
         self.speed = config['speed']
         self.vehicle_type_lower = self.vehicle_type.lower()
+
+        # Data-collection instrumentation (optional, non-breaking)
+        self.start_goal_id = config.get('start_goal_id', None)
+        self.seed = config.get('seed', None)
+        # A sustained attitude beyond this (deg) is treated as a rollover
+        # (mission-level, non-operational failure).
+        self.rollover_threshold = config.get('rollover_threshold', 75.0)
         
         # Initialize system
         self.system = chrono.ChSystemNSC()
@@ -153,7 +160,7 @@ class PIDSim:
         if self.vehicle_type_lower in ['m113']:
             self.vis =veh.ChTrackedVehicleVisualSystemIrrlicht()
         self.vis.SetWindowTitle('vws in the wild')
-        self.vis.SetWindowSize(3840, 2160)
+        self.vis.SetWindowSize(1280, 720)
         
         if self.vehicle_type_lower in ['man5t', 'man7t', 'man10t']:
             trackPoint = chrono.ChVector3d(-5.5, 0.0, 2.6)
@@ -186,10 +193,21 @@ class PIDSim:
         # Use positions from config
         if start_pos is None or goal_pos is None:
             positions = self.terrain_manager.positions
-            pos_id = random.randint(0, len(positions) - 1)
+            if self.seed is not None:
+                random.seed(self.seed)
+            if self.start_goal_id is not None:
+                if not (0 <= self.start_goal_id < len(positions)):
+                    raise ValueError(
+                        f"start_goal_id must be in [0, {len(positions) - 1}], got {self.start_goal_id}")
+                pos_id = self.start_goal_id
+            else:
+                pos_id = random.randint(0, len(positions) - 1)
+            self.start_goal_id = pos_id
             selected_pair = positions[pos_id]
             start_pos = [i * self.scale_factor for i in selected_pair['start']]
             goal_pos = [i * self.scale_factor for i in selected_pair['goal']]
+        self.start_pos = start_pos
+        self.goal_pos = goal_pos
         
         # Initialize terrain
         self.terrains = self.terrain_manager.initialize_terrain(self.system)
@@ -210,6 +228,12 @@ class PIDSim:
         obs_path = self.terrain_manager.obs_path
         self.chrono_path = self.planner.astar_path(obs_path, start_pos, goal_pos)
         self.local_goal_idx = 0
+
+        # Intended A-to-B distance: length of the planned path, straight-line fallback
+        straight = ((goal_pos[0] - start_pos[0]) ** 2 + (goal_pos[1] - start_pos[1]) ** 2) ** 0.5
+        planned = self._path_length(self.chrono_path)
+        self.total_path_length = planned if planned and planned > 0 else straight
+        self.straight_line_length = straight
         
         # Set up visualization
         if self.render:
@@ -218,16 +242,54 @@ class PIDSim:
         # Set up driver
         self._setup_driver()
             
+    @staticmethod
+    def _path_length(path):
+        """Total planar length of a polyline of (x, y) points."""
+        if not path or len(path) < 2:
+            return 0.0
+        total = 0.0
+        for a, b in zip(path[:-1], path[1:]):
+            total += ((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2) ** 0.5
+        return total
+
+    def _assemble_result(self, success, failure_mode, sim_time, roll_angles, pitch_angles,
+                         traveled, remaining, max_roll, max_pitch, final_pos, time_at_failure):
+        """Build the per-run result dict consumed by the data-collection harness."""
+        avg_roll = float(np.mean(roll_angles)) if roll_angles else 0.0
+        avg_pitch = float(np.mean(pitch_angles)) if pitch_angles else 0.0
+        return {
+            'success': bool(success),
+            'failure_mode': failure_mode,
+            'time_to_goal': sim_time if success else None,
+            'time_at_failure': None if success else time_at_failure,
+            'sim_time': sim_time,
+            'traveled_distance': traveled,
+            'distance_at_failure': None if success else traveled,
+            'remaining_distance': remaining,
+            'total_path_length': getattr(self, 'total_path_length', None),
+            'straight_line_length': getattr(self, 'straight_line_length', None),
+            'avg_roll': avg_roll,
+            'avg_pitch': avg_pitch,
+            'max_roll': max_roll,
+            'max_pitch': max_pitch,
+            'final_x': final_pos[0],
+            'final_y': final_pos[1],
+            'start_goal_id': getattr(self, 'start_goal_id', None),
+        }
+
     def run(self):
         """Run the simulation"""
         # Check initialization
         if not hasattr(self, 'terrains') or not self.terrains:
             raise ValueError("Simulation not initialized. Call initialize() first.")
-            
+
         # Initialize timing
         start_time = self.system.GetChTime()
         roll_angles = []
         pitch_angles = []
+        traveled = 0.0
+        max_roll = 0.0
+        max_pitch = 0.0
         
         # Main simulation loop
         while True:
@@ -257,9 +319,29 @@ class PIDSim:
                 roll = euler_angles.x
                 pitch = euler_angles.y
                 vehicle_heading = euler_angles.z
-                roll_angles.append(np.degrees(abs(roll)))
-                pitch_angles.append(np.degrees(abs(pitch)))
-                
+                roll_deg = np.degrees(abs(roll))
+                pitch_deg = np.degrees(abs(pitch))
+                roll_angles.append(roll_deg)
+                pitch_angles.append(pitch_deg)
+                max_roll = max(max_roll, roll_deg)
+                max_pitch = max(max_pitch, pitch_deg)
+
+                # Rollover: attitude past threshold is a terminal, non-operational failure
+                if roll_deg > self.rollover_threshold or pitch_deg > self.rollover_threshold:
+                    print('--------------------------------------------------------------')
+                    print('Vehicle rolled over!')
+                    print(f'Roll: {roll_deg:.1f} deg, Pitch: {pitch_deg:.1f} deg')
+                    print(f'Sim time: {time - start_time:.2f} s')
+                    print(f'Distance to goal: {vector_to_goal.Length():.2f} m')
+                    print('--------------------------------------------------------------')
+                    if self.render:
+                        self.vis.Quit()
+                    return self._assemble_result(
+                        False, 'rollover', time - start_time, roll_angles, pitch_angles,
+                        traveled, vector_to_goal.Length(), max_roll, max_pitch,
+                        (vehicle_pos.x, vehicle_pos.y, vehicle_pos.z), time - start_time)
+
+
                 # Check if replanning is needed
                 if time - self.last_replan_time >= self.replan_interval:
                     print("Replanning path...")
@@ -322,7 +404,10 @@ class PIDSim:
                     (current_position[1] - self.last_position[1])**2 +
                     (current_position[2] - self.last_position[2])**2
                 )
-                
+
+                # Accumulate travelled path distance (odometer)
+                traveled += position_change
+
                 if position_change < self.stuck_distance:
                     self.stuck_counter += self.step_size
                 else:
@@ -341,11 +426,14 @@ class PIDSim:
                     
                     if self.render:
                         self.vis.Quit()
-                        
-                    avg_roll = np.mean(roll_angles) if roll_angles else 0
-                    avg_pitch = np.mean(pitch_angles) if pitch_angles else 0
-                    return time - start_time, False, avg_roll, avg_pitch
-            
+
+                    # Stuck began roughly stuck_counter seconds ago
+                    stuck_start = max(0.0, (time - start_time) - self.stuck_counter)
+                    return self._assemble_result(
+                        False, 'stuck', time - start_time, roll_angles, pitch_angles,
+                        traveled, vector_to_goal.Length(), max_roll, max_pitch,
+                        current_position, stuck_start)
+
             self.last_position = current_position
             
             # Check if goal reached
@@ -358,11 +446,12 @@ class PIDSim:
                 
                 if self.render:
                     self.vis.Quit()
-                    
-                avg_roll = np.mean(roll_angles) if roll_angles else 0 
-                avg_pitch = np.mean(pitch_angles) if pitch_angles else 0
-                return time - start_time, True, avg_roll, avg_pitch
-            
+
+                return self._assemble_result(
+                    True, 'reached', time - start_time, roll_angles, pitch_angles,
+                    traveled, vector_to_goal.Length(), max_roll, max_pitch,
+                    current_position, None)
+
             # Check if time limit exceeded
             if time > self.max_time:
                 print('--------------------------------------------------------------')
@@ -373,13 +462,14 @@ class PIDSim:
                 print('Goal position: ', self.vehicle_manager.goal)
                 print('Distance to goal: ', dist)
                 print('--------------------------------------------------------------')
-                
+
                 if self.render:
                     self.vis.Quit()
-                    
-                avg_roll = np.mean(roll_angles) if roll_angles else 0 
-                avg_pitch = np.mean(pitch_angles) if pitch_angles else 0
-                return time - start_time, False, avg_roll, avg_pitch
+
+                return self._assemble_result(
+                    False, 'timeout', time - start_time, roll_angles, pitch_angles,
+                    traveled, vector_to_goal.Length(), max_roll, max_pitch,
+                    current_position, time - start_time)
             
             # Synchronize terrains and vehicle
             for terrain in self.terrains:
@@ -402,6 +492,10 @@ class PIDSim:
             
             # Step the system
             self.system.DoStepDynamics(self.step_size)
-        
-        return None, False, 0, 0  # Return default values if loop exits unexpectedly
+
+        # Loop exited unexpectedly (e.g. render window closed)
+        final_pos = self.last_position if self.last_position else (0.0, 0.0, 0.0)
+        return self._assemble_result(
+            False, 'aborted', self.system.GetChTime() - start_time, roll_angles, pitch_angles,
+            traveled, 0.0, max_roll, max_pitch, final_pos, self.system.GetChTime() - start_time)
     

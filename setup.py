@@ -14,49 +14,66 @@ import argparse
 from PIL import Image
 
 from verti_bench.envs.utils.utils import SetChronoDataDirectories
-from verti_bench.systems.PID.PID_sim import PIDSim
-from verti_bench.systems.EH.EH_sim import EHSim
-from verti_bench.systems.MPPI.MPPI_sim import MPPISim
-from verti_bench.systems.RL.RL_sim import RLSim
-from verti_bench.systems.MCL.MCL_sim import MCLSim
-from verti_bench.systems.ACL.ACL_sim import ACLSim
-from verti_bench.systems.WMVCT.WMVCT_sim import WMVCTSim
-from verti_bench.systems.MPPI6.MPPI6_sim import MPPI6Sim
-from verti_bench.systems.TAL.TAL_sim import TALSim
-from verti_bench.systems.TNT.TNT_sim import TNTSim
-from verti_bench.systems.Manual.Manual_sim import ManualSim
+
+def _make_sim(config):
+    """Lazily import and construct only the requested control system.
+
+    Systems other than PID pull in heavy/optional deps (e.g. ROS grid_map_msgs
+    for MPPI), so importing all of them eagerly breaks a PID-only environment.
+    """
+    system = config['system']
+    if system == 'pid':
+        from verti_bench.systems.PID.PID_sim import PIDSim
+        return PIDSim(config)
+    elif system == 'eh':
+        from verti_bench.systems.EH.EH_sim import EHSim
+        return EHSim(config)
+    elif system == 'mppi':
+        from verti_bench.systems.MPPI.MPPI_sim import MPPISim
+        return MPPISim(config)
+    elif system == 'rl':
+        from verti_bench.systems.RL.RL_sim import RLSim
+        return RLSim(config)
+    elif system == 'mcl':
+        from verti_bench.systems.MCL.MCL_sim import MCLSim
+        return MCLSim(config)
+    elif system == 'acl':
+        from verti_bench.systems.ACL.ACL_sim import ACLSim
+        return ACLSim(config)
+    elif system == 'wmvct':
+        from verti_bench.systems.WMVCT.WMVCT_sim import WMVCTSim
+        return WMVCTSim(config)
+    elif system == 'mppi6':
+        from verti_bench.systems.MPPI6.MPPI6_sim import MPPI6Sim
+        return MPPI6Sim(config)
+    elif system == 'tal':
+        from verti_bench.systems.TAL.TAL_sim import TALSim
+        return TALSim(config)
+    elif system == 'tnt':
+        from verti_bench.systems.TNT.TNT_sim import TNTSim
+        return TNTSim(config)
+    elif system == 'manual':
+        from verti_bench.systems.Manual.Manual_sim import ManualSim
+        return ManualSim(config)
+    raise ValueError(f"Unsupported system type: {system}")
 
 def single_experiment(config):
-    """Run a single simulation experiment"""
-    # Create and initialize simulation
-    if config['system'] == 'pid':
-        sim = PIDSim(config)
-    elif config['system'] == 'eh':
-        sim = EHSim(config)
-    elif config['system'] == 'mppi':
-        sim = MPPISim(config)
-    elif config['system'] == 'rl':
-        sim = RLSim(config)
-    elif config['system'] == 'mcl':
-        sim = MCLSim(config)
-    elif config['system'] == 'acl':
-        sim = ACLSim(config)
-    elif config['system'] == 'wmvct':
-        sim = WMVCTSim(config)
-    elif config['system'] == 'mppi6':
-        sim = MPPI6Sim(config)
-    elif config['system'] == 'tal':
-        sim = TALSim(config)
-    elif config['system'] == 'tnt':
-        sim = TNTSim(config)
-    elif config['system'] == 'manual':
-        sim = ManualSim(config)
+    """Run a single simulation experiment.
+
+    PID_sim.run() returns a rich result dict (with failure_mode and the
+    distance/time-at-failure instrumentation); the other systems still return
+    the legacy ``(time_to_goal, success, avg_roll, avg_pitch)`` tuple. Normalize
+    both so downstream code keeps working unchanged.
+    """
+    sim = _make_sim(config)
     sim.initialize()
-    
-    # Run simulation
-    time_to_goal, success, avg_roll, avg_pitch = sim.run()
-    
-    # Return results
+    result = sim.run()
+
+    if isinstance(result, dict):
+        return result
+
+    # Legacy tuple shape -> original dict (unchanged behavior)
+    time_to_goal, success, avg_roll, avg_pitch = result
     return {
         'time_to_goal': time_to_goal if success else None,
         'success': success,
@@ -118,8 +135,12 @@ def parse_arguments():
     
     # World parameters
     parser.add_argument('--world_id', type=int, default=1, help='World ID (1-100, default: 1)')
-    parser.add_argument('--scale_factor', type=float, default=1.0, 
+    parser.add_argument('--scale_factor', type=float, default=1.0,
                         help='Scale factor for terrain (default: 1.0, options: 1.0, 1/6, 1/10)')
+    parser.add_argument('--start_goal_id', type=int, default=None,
+                        help='Which of the world\'s 10 start/goal pairs (0-9). Default: random.')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='RNG seed for reproducibility (default: None).')
     
     # Simulation parameters
     parser.add_argument('--max_time', type=float, default=60.0, help='Maximum simulation time in seconds (default: 60.0)')
@@ -151,7 +172,9 @@ if __name__ == '__main__':
         'max_time': args.max_time,
         'scale_factor': args.scale_factor,
         'render': args.render,
-        'use_gui': args.use_gui
+        'use_gui': args.use_gui,
+        'start_goal_id': args.start_goal_id,
+        'seed': args.seed
     }
     
     print("--------------------------------------------------------------")
