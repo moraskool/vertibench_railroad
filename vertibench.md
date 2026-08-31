@@ -19,6 +19,12 @@ is written out below.
 3. **Verify these against our sim model** (the hand-authored table in section 2) and **adjust the model where
    necessary** (section 6 is how).
 
+**Where this stands (2026-08-29).** Steps 1 and 2 are done for a pilot batch: `collect_crossings.py`
+and `analysis/terrain_features.py` exist and produced 270 rows covering 2 vehicles. Step 3 was never
+done, and `terrain_bucket` is empty on every row. Round 2, specified in section 5, widens the pilot to
+all 9 vehicles and a stratified sample of the worlds, at a fixed speed. Section 5b records what round 1
+found and the design flaw round 2 corrects. Read section 5b before running anything.
+
 ---
 
 ## 1. Why we are collecting this data
@@ -85,13 +91,31 @@ probability toward a distance-to-failure distribution if we want a richer edge m
 
 Facts to design the sweep around:
 
-- **Vehicles (9):** `hmmwv`, `gator`, `feda`, `man5t`, `man7t`, `man10t`, `m113`, `art`, `vw`.
+- **Vehicles (9):** `hmmwv`, `gator`, `feda`, `man5t`, `man7t`, `man10t`, `m113`, `art`, `vw`. All nine are
+  dispatched in `systems/PID/PID_sim.py:136-152`, so all nine run under `pid`.
 - **Controllers/systems (10, + manual):** `pid` (default), `eh`, `mppi`, `rl`, `mcl`, `acl`, `wmvct`,
   `mppi6`, `tal`, `tnt`, `manual`.
-- **Worlds:** **100 elevation maps** (`world_id` 1..100, under `envs/data/BenchMaps/sampled_maps/Worlds`),
-  each with **10 fixed start/goal pairs**, so **1000 built-in A-to-B tasks**. Use these built-in pairs as
-  your "location A to location B", do not invent your own.
+- **Worlds:** **100 elevation maps** (`world_id` 1..100, configs under
+  `envs/data/BenchMaps/sampled_maps/Configs/Final`), each with **exactly 10 fixed start/goal pairs**
+  (verified: all 100 configs carry 10 `positions`), so **1000 built-in A-to-B tasks**. Use these built-in
+  pairs as your "location A to location B", do not invent your own.
 - **Scale:** `scale_factor` `1.0` (default), `1/6`, `1/10`.
+
+**The worlds come pre-stratified two ways, and this is the bridge to our terrain model.** The obstacle
+tier is the suffix on the config filename (`config3_mid.yaml`), and the surface class is the
+`terrain_type` field inside the config. Counting all 100:
+
+| tier | rigid | deformable | mixed | total |
+|------|-------|------------|-------|-------|
+| low  | 22    | 7          | 6     | 35    |
+| mid  | 18    | 11         | 3     | 32    |
+| high | 20    | 12         | 1     | 33    |
+| **total** | **60** | **30** | **10** | **100** |
+
+VertiBench labelling its own worlds is a cleaner archetype source than clustering slope and roughness after
+the fact, so prefer this 3x3 grid when filling `terrain_bucket` (section 6). Note the corner: **only one
+world in the entire population is mixed/high** (world 92), so that cell can never be deep. Report it as
+thin rather than padding it.
 
 **The maps are real-world, mixed-terrain** off-road elevation (rigid and deformable surfaces, boulders,
 rocks, snow, in the same map). A single A-to-B run therefore crosses a *mixture* of conditions rather than
@@ -136,20 +160,135 @@ planner benchmarks, so the two datasets analyse the same way.
 
 ---
 
-## 5. Sweep design (the 20-30 trials each)
+## 5. Sweep design (round 2, the one to run)
 
-- **Axes:** `vehicle` × `terrain condition`. Fix `controller = pid` (deterministic, simplest baseline) and a
-  single representative `speed` and `scale_factor = 1.0` for the first pass.
-- **20-30 trials per (vehicle, terrain-condition) cell.** A proportion's Wilson interval tightens well by 30;
-  go to 30 for cells near 50% success (max variance), 20 is fine for clearly easy/hard cells.
-- **Where the independent trials come from (read this, PID is deterministic):** same vehicle, same world,
-  same start/goal pair, same seed gives an **identical** result. Do **not** repeat one crossing 25 times. Get
-  independent draws by varying across the **10 start/goal pairs of a world** and across **several worlds in
-  the same terrain-condition bucket** (section 6), plus the seed.
+**Principles:**
+
+- **~15 trials per (vehicle, terrain class) cell.** SE on a failure rate is then about 0.12, enough to fit
+  hazard and compatibility and far short of exhaustive. The precision curve is flat here: n=18 gives +/-21
+  points at p=0.5 and n=24 gives +/-19, so buying larger cells is poor value.
+- **The target is a continuous fit, not per-cell rates.** Per section 6, estimate `p_success` as a function of
+  (vehicle, measured terrain features) across all rows. Cell counts only need to be large enough to support
+  that fit, which is why balance matters more than depth.
+- **Where independent draws come from:** vary across the **10 start/goal pairs of a world** and across
+  **several worlds of the same terrain class**. Two pairs on one map are correlated, so prefer more worlds
+  over more pairs, except where a class has few worlds in the population.
 - Run **headless** (`render=false use_gui=false`) for throughput. Render only a handful for a sanity video.
 
-**Start tiny:** one vehicle, one world, one start/goal pair, 1 run, headless, confirm one fully-populated row
-lands in the CSV. Then widen to the grid. Do not launch the full sweep before a single cell is proven.
+**Fixed for round 2:** `controller = pid`, `speed = 8.0`, `scale_factor = 1.0`, `max_time = 60`, `seed = 0`,
+all 9 vehicles. Speed is **fixed, not swept**. Round 1 swept it over five levels and that was a mistake
+(section 5b). Our failure model has no speed term, so a single speed is what yields a clean `p_success`.
+
+**Worlds: 16, chosen on two axes at once.**
+
+| class | worlds | pairs | trials/vehicle | runs |
+|-------|--------|-------|----------------|------|
+| rigid (60 in pop) | 1, 3, 5, 15, 20, 42, 56, 60 | 0-1 | 8 x 2 = 16 | 144 |
+| deformable (30) | 61, 62, 74, 79, 89 | 0-2 | 5 x 3 = 15 | 135 |
+| mixed (10) | 92, 95, 97 | 0-4 | 3 x 5 = 15 | 135 |
+| **total** | **16 worlds** | | | **414** |
+
+**Why this shape:**
+
+- **Rigid draws from more worlds, mixed from more pairs.** Rigid is plentiful so its trials come from eight
+  uncorrelated maps. Only ten mixed worlds exist, so that class takes its trials from more pairs instead.
+- **Mixed is kept, and it is not optional.** Measured `terrain_deformability` is 0.0 on every rigid world and
+  1.0 on every deformable one. Every interior value in round 1 (0.08, 0.14, 0.16, 0.23, 0.31, 0.42, 0.44)
+  came from a mixed world. Without them that predictor is binary and the continuous fit has no interior
+  support. Mixed maps are also the deployment reality (section 3).
+- **The tier spread is balanced deliberately.** Tier is effectively the slope axis: round 1 measured low at
+  0.10-0.13, mid at 0.25-0.29, high at 0.43-0.54. The 16 worlds are **6 high, 4 mid, 6 low**. An earlier draw
+  came out 6/7/3, which left the whole high-success end of the curve resting on three worlds. Keep the ends
+  populated when substituting worlds.
+- **Seven worlds overlap the pilot** (1, 3, 5, 61, 62, 74, 92), giving a free check: hmmwv and gator at speed
+  8 should land close to round 1. Expect close, **not identical** (section 9), and treat the spread as a
+  measurement of the noise floor, which is worth reporting.
+
+**Cost: about 6.5 min/run blended across the nine vehicles**, measured, not inferred. The vehicles differ a
+lot (m113 ~4m20s and vw ~5m33s on a 15 s run, worse at `max_time=60`), so do not size a sweep off hmmwv
+alone. 414 runs on 2 threads is roughly **a full day**, not a single night.
+
+**Parallelism and resume are built into the script.** `--parallel N` splits the task list by world across
+N workers, each writing its own shard CSV which the parent merges at the end, so there is no shared file and
+no lock. `--resume` skips any (vehicle, world, pair, speed) already in the CSV. Arms let one command mix the
+three pair counts.
+
+```bash
+cd ~/Documents/verti_bench
+export LD_PRELOAD=/usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so.1
+V="hmmwv gator feda man5t man7t man10t m113 art vw"
+ARMS="--arm 1,3,5,15,20,42,56,60:0,1 --arm 61,62,74,79,89:0,1,2 --arm 92,95,97:0,1,2,3,4"
+
+# 0. see the plan without running anything
+vpy collect_crossings.py --dry_run --parallel 2 --speeds 8 --vehicles $V $ARMS \
+    --csv results/terrain_crossing_b2.csv
+
+# 1. smoke test one cell, confirm one fully-populated row
+vpy collect_crossings.py --vehicles hmmwv --worlds 5 --start_goal_ids 0 \
+    --speeds 8 --max_time 60 --csv /tmp/smoke.csv
+
+# 2. the run, survives the terminal closing
+nohup vpy collect_crossings.py --parallel 2 --resume --speeds 8 --max_time 60 \
+    --vehicles $V $ARMS --csv results/terrain_crossing_b2.csv \
+    > sweep_b2.log 2>&1 &
+```
+
+`--dry_run` prints 414 runs and the per-worker split (216 and 198, worlds disjoint). Monitor with:
+
+```bash
+tail -f results/terrain_crossing_b2.csv.shard0.log   # per-worker progress
+wc -l results/terrain_crossing_b2.csv*               # rows so far
+ps aux | grep -c "[c]ollect_crossings"               # 3 while running: parent + 2 workers
+```
+
+When both workers exit the parent merges the shards into `results/terrain_crossing_b2.csv`, header once,
+and deletes them. Expect 415 lines.
+
+**If a worker dies partway**, rerun the exact same command. `--resume` reads the merged CSV, skips what is
+already there, and runs only the remainder. The parent merges whatever the workers flushed before dying, so
+nothing is lost and nothing is duplicated. This is why `--resume` exists: on a job this long, dying at hour
+18 and restarting from zero is the real risk.
+
+**Start tiny:** the smoke test above is step 0, not optional. Then watch RSS on both processes through a
+deformable world before leaving the sweep unattended. The machine must stay awake for a full day, so disable
+sleep, and note that WSL2 suspending will stall the run.
+
+**Not swept, and why:** speed (fixed, round 1 covered it), the other 84 worlds, pairs 5-9 for the rigid and
+deformable arms, `scale_factor` 1/6 and 1/10, and the ten non-`pid` controllers.
+
+---
+
+## 5b. What round 1 found, and the flaw round 2 fixes
+
+Round 1 is on disk at `results/terrain_crossing.csv`, 270 rows, and was copied to the parent repo
+unchanged. Design: 2 vehicles (`hmmwv`, `gator`) x 9 worlds x 3 pairs x **5 speeds** (4, 6, 8, 10, 12) x
+1 seed. The nine worlds were one per cell of the section 3 grid, so the stratification was deliberate.
+
+Outcome: 119 reached, 83 stuck, 55 rollover, 13 timeout.
+
+**The flaw: speed was swept and then pooled.** Each per-world cell is quoted as 15 traversals, but those 15
+are 3 paths x 5 speeds, and speed moves success from 35% to 54% overall. A design factor with a real effect
+is currently sitting inside a number that gets read as a terrain rate. Round 2 fixes this by fixing speed.
+Round 1 still stands on its own as the characterization of the speed effect, so nothing is wasted.
+
+**Watch item, carried forward.** `hmmwv` beat `gator` in 8 of the 9 worlds, 0.59 against 0.30 overall, and
+only world 5 inverted. Our model assumes two complementary specialists where the same ground is risky for one
+and safe for the other. Round 1 shows one better vehicle plus one exception instead. Round 2 with nine
+vehicles is the test: either more inversions appear across the wider roster, or the modelling assumption
+softens from symmetric specialists to capability-dependent suitability. Report which.
+
+**Two facts established while running round 1, both correcting this brief as originally written:**
+
+- **Runs are not deterministic.** Section 9 used to claim PID gives an identical result for the same
+  (vehicle, world, pair, seed). It does not: multithreaded collision handling makes repeats vary, which is
+  why demo runs flip outcome. Repeats are therefore a legitimate source of variation, and the pilot-overlap
+  check in section 5 measures the noise floor rather than proving reproducibility.
+- **Per-run cost varies a lot by vehicle.** Probed directly: m113 about 4m20s and vw about 5m33s on a 15 s
+  run, worse at `max_time=60`, blending to roughly 6.5 min/run across the nine. Timing a sweep off hmmwv
+  alone underestimates it by several times over. Size budgets from the blended figure.
+
+**Not yet done:** `terrain_bucket` is empty on all 270 rows, and the section 6 step 3 comparison against the
+hand-authored model was never carried out. Those are the deliverables round 2 must actually close.
 
 ---
 
@@ -180,9 +319,29 @@ a convenient discretization of that.
 the features, otherwise leave the raw feature columns to speak for themselves. Keeping `distance_at_failure`
 and the per-path feature profile is what makes the segment-level attribution possible.
 
+**For round 2 the continuous fit is the deliverable, and `terrain_bucket` is the readable summary of it.**
+Fit `p_success` on the measured feature columns first, per the paragraph above. Then fill `terrain_bucket`
+from the built-in strata (section 3), the tier in the config filename crossed with the config's
+`terrain_type`, which is a 9-way label VertiBench itself assigns and beats clustering our feature columns
+after the fact. Leaving it empty is what stalled round 1. Where the fitted surface and the 9 strata disagree,
+report the disagreement and collapse the strata rather than forcing the data into them.
+
 ---
 
 ## 7. What the harness already gives you, and what you must instrument
+
+**Round 1 already did this instrumentation.** `collect_crossings.py` (repo root) drives the sweep and writes
+the 24-column CSV, and `analysis/terrain_features.py` measures the terrain features. The rest of this section
+is the record of what was built and what is still missing. Two notes before the detail:
+
+- **`world_cache` was removed (2026-08-29).** The loop is now world-outer and holds only the current world,
+  dropping it before the next. Each world carries two 1291x1291 float64 grids, about 27 MB, and the old
+  vehicle-outer loop cached every world it touched. At 32 worlds that is ~860 MB per process, which does not
+  fit twice over on this machine. Keep the world-outer shape if you touch that loop.
+- **Still missing: segment-level attribution.** `path_features()` samples 64 points along the *straight* A-to-B
+  line, so the feature columns describe the intended route, not the driven one, and not the failure location.
+  `distance_at_failure` is populated and `local_features()` already exists, so reading features at the failure
+  point is a small addition and is the cleanest signal from a mixed map (section 6 step 2).
 
 Confirmed from `setup.py`:
 
@@ -216,11 +375,19 @@ machine, that is why `vpy` and the 6 GB asset tree exist. Do not rebuild or re-c
 
 ## 8. Deliverable back to the parent project
 
-- **One tidy CSV** with the schema in section 4, written somewhere stable inside the VertiBench repo
-  (e.g. `results/terrain_crossing.csv`). We will copy it back into `resilient_mrp` for analysis.
+- **One tidy CSV** with the schema in section 4, written somewhere stable inside the VertiBench repo. For
+  round 2 that is the two `results/terrain_crossing_b2_*.csv` shards concatenated into
+  `results/terrain_crossing_b2.csv`, header once. Leave round 1's `terrain_crossing.csv` in place, do not
+  append to it, the two batches have different speed designs and must not be pooled by accident.
+- **`terrain_bucket` populated on every row.** This is the one field round 1 left empty and it is what blocks
+  everything downstream.
+- **The inversion**, per (vehicle, bucket): empirical `p_success`, then `hazard_severity` and `compatibility`
+  backed out of `p_success = 1 - hazard_severity * (1 - compatibility)`, in a form we can paste over the
+  section 2 tables.
 - A **short note** on: how you mapped map features to our terrain types (section 6), any field you could not
-  populate and why, the measured-vs-predicted comparison and any model adjustments, and the exact command(s)
-  that produced the CSV so we can rerun.
+  populate and why, the measured-vs-predicted comparison and any model adjustments, whether the wider vehicle
+  roster produces the capability inversions the model assumes (section 5b watch item), and the exact
+  command(s) that produced the CSV so we can rerun.
 - Do **not** commit the 6 GB assets or large sim artifacts. Just the CSV and any small scripts you add.
 
 The end use on our side: turn the per-(vehicle, terrain) success rates into calibrated `compatibility` /
@@ -234,6 +401,14 @@ tidy and one-row-per-run is what makes that drop-in.
 
 - This runs under **`chrono9` / `vpy`** (Python 3.9), **not** the parent repo's `uv` env. Never mix them.
 - Headless throughput first, rendering is for spot-checks only.
-- PID is deterministic: independence comes from varying (world, start/goal pair, seed), not from repeats.
+- **PID is not deterministic.** Multithreaded collision handling makes the same (vehicle, world, pair, seed)
+  vary between runs. Independence still comes mainly from varying world and start/goal pair, since those
+  change the terrain rather than resampling the same crossing, but repeats do carry information and a
+  re-run of a pilot cell measures the noise floor rather than reproducing it.
+- **Budget about 6.5 min/run blended across the nine vehicles**, not the ~1 min hmmwv suggests. m113 and vw
+  are the slow ones, measured at 4m20s and 5m33s on a 15 s run.
+- **Memory, not CPU, is the binding constraint** on this machine. Each world holds two 1291x1291 float64
+  grids, about 27 MB, so `collect_crossings.py` keeps only the current world resident (section 7). Watch RSS
+  through a deformable world before leaving a sweep unattended.
 - If an import segfaults, it is the known OpenMP clash: prefix with
   `LD_PRELOAD=/usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so.1`.

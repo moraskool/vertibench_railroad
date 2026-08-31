@@ -243,10 +243,14 @@ class TerrainManager:
         
         # Create file path
         patch_file = f"terrain_patch_{idx}.bmp"
+        # Per-process tmp dir so parallel workers don't race on a shared path
+        # (one worker's rmtree vs another's write -> OSError: Directory not empty,
+        #  and clobbered terrain_patch_*.bmp files). See rl/off_road_VertiBench.py.
         terrain_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)),
-                                "./data/BenchMaps/sampled_maps/Configs/tmp")
-        
-        # Clean up previous tmp directory
+                                "./data/BenchMaps/sampled_maps/Configs/tmp",
+                                f"pid_{os.getpid()}")
+
+        # Clean up only THIS process's previous tmp directory
         if os.path.exists(terrain_dir):
             shutil.rmtree(terrain_dir)
         
